@@ -1,0 +1,14 @@
+```shell
+#!/bin/sh
+host=0.0.0.0
+port=6387
+redis-cli -h $host -p $port keys "*" > keys.txt
+more keys.txt | grep -v ^$ | while read mykey
+do
+  result=`redis-cli -h $host -p $port -c ttl $mykey` 
+  if [ $result -eq -1 ]
+    then
+      echo $mykey
+  fi
+done
+```

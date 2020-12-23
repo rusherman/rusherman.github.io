@@ -1,0 +1,13 @@
+主机小新13pro 锐龙2020 4800u
+系统 manjaro
+问题：无法识别外接显示器直接黑屏卡死
+查找问题途径：archwiki，manjarowiki ，admgpu驱动已经完全安装，问题依旧存在
+查阅[https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c)
+ 源码
+```
+/* Renoir */
+	{0x1002, 0x1636, PCI_ANY_ID, PCI_ANY_ID, 0, 0, CHIP_RENOIR|AMD_IS_APU}, 
+```
+驱动已经被包含
+然后xrandr发现有一个eDP两个DisplayPort接口，推测不识别扩展坞的hmdi接口导致，外接显示器上观察有DP接口，
+后买入一根Type-c转DP的线，插入后直接点亮
