@@ -1,0 +1,4 @@
+#1. [Java集合及concurrent并发包总结（转）](http://www.cnblogs.com/vijozsoft/p/5585620.html)
+#2.[关于Golang和JVM中并发模型实现的探讨](https://studygolang.com/articles/8674)
+#3.[JVM内幕：Java虚拟机详解](http://www.importnew.com/17770.html)
+#4.[操作系统信号量机制](https://blog.csdn.net/lpjishu/article/details/51378607)

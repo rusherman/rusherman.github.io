@@ -1,0 +1,6 @@
+更新完macOS Catalina(Version 10.15), 发现根目录的/data目录被移除了, 很是懊恼, 和同事交流找了个办法搞回来, 以下是步骤.
+
+关机按cmd+R重启进入恢复模式, 关闭SIP(命令: csrutil disable ), 正常重启
+重新挂载根目录 (命令: sudo mount -uw /), 在你喜欢的地方建立data目录, 比如 mkdir /users/allen/data, 然后建立软连接sudo ln -s /users/allen/data /data
+(这步可选)关机按cmd+R重启进入恢复模式, 重新打开SIP(命令: csrutil enable), 正常重启
+现在可以正常使用 /data 目录了

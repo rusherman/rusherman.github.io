@@ -1,0 +1,664 @@
+##1.spring对mybatis的事务管理是怎么支持的
+###一、事务的基本原理
+Spring事务的本质其实就是数据库对事务的支持，没有数据库的事务支持，spring是无法提供事务功能的。对于纯JDBC操作数据库，想要用到事务，可以按照以下步骤进行：
+
+    1.获取连接 Connection con = DriverManager.getConnection()
+    2.开启事务con.setAutoCommit(true/false);
+    3.执行CRUD
+    4.提交事务/回滚事务 con.commit() / con.rollback();
+    5.关闭连接 conn.close();
+使用Spring的事务管理功能后，我们可以不再写步骤 2 和 4 的代码，而是由Spirng 自动完成。那么Spring是如何在我们书写的 CRUD 之前和之后开启事务
+和关闭事务的呢？解决这个问题，也就可以从整体上理解Spring的事务管理实现原理了。下面简单地介绍下，注解方式为例子
+
+    1.配置文件开启注解驱动，在相关的类和方法上通过注解@Transactional标识。
+    2.spring 在启动的时候会去解析生成相关的bean，这时候会查看拥有相关注解的类和方法，并且为这些类和方法生成代理，并根据@Transaction的相关参数进行相关配置注入，这样就在代理中为我们把相关的事务处理掉了（开启正常提交事务，异常回滚事务）。
+    3.真正的数据库层的事务提交和回滚是通过binlog或者redo log实现的。
+###二、Spring 事务的传播属性
+所谓spring事务的传播属性，就是定义在存在多个事务同时存在的时候，spring应该如何处理这些事务的行为。这些属性在TransactionDefinition中定义，具体常量的解释见下表：
+
+|常量名称	|常量解释
+|------------|-------------
+|PROPAGATION_REQUIRED|	支持当前事务，如果当前没有事务，就新建一个事务。这是最常见的选择，也是 Spring 默认的事务的传播。
+|PROPAGATION_REQUIRES_NEW|	新建事务，如果当前存在事务，把当前事务挂起。新建的事务将和被挂起的事务没有任何关系，是两个独立的事务，外层事务失败回滚之后，不能回滚内层事务执行的结果，内层事务失败抛出异常，外层事务捕获，也可以不处理回滚操作
+|PROPAGATION_SUPPORTS|	支持当前事务，如果当前没有事务，就以非事务方式执行。
+|PROPAGATION_MANDATORY|	支持当前事务，如果当前没有事务，就抛出异常。
+|PROPAGATION_NOT_SUPPORTED|	以非事务方式执行操作，如果当前存在事务，就把当前事务挂起。
+|PROPAGATION_NEVER|	以非事务方式执行，如果当前存在事务，则抛出异常。
+|PROPAGATION_NESTED|	如果一个活动的事务存在，则运行在一个嵌套的事务中。如果没有活动事务，则按REQUIRED属性执行。它使用了一个单独的事务，这个事务拥有多个可以回滚的保存点。内部事务的回滚不会对外部事务造成影响。它只对DataSourceTransactionManager事务管理器起效。
+
+###三、数据库隔离级别
+|隔离级别	|隔离级别的值	|导致的问题
+|------------|-------------------|----------------
+|Read-Uncommitted	|0	|导致脏读
+|Read-Committed	|1	|避免脏读，允许不可重复读和幻读
+|Repeatable-Read	|2	|避免脏读，不可重复读，允许幻读
+|Serializable	|3	|串行化读，事务只能一个一个执行，避免了脏读、不可重复读、幻读。执行效率慢，使用时慎重
+__脏读__：一事务对数据进行了增删改，但未提交，另一事务可以读取到未提交的数据。如果第一个事务这时候回滚了，那么第二个事务就读到了脏数据。
+
+__不可重复读__：一个事务中发生了两次读操作，第一次读操作和第二次操作之间，另外一个事务对数据进行了修改，这时候两次读取的数据是不一致的。
+
+__幻读__：第一个事务对一定范围的数据进行批量修改，第二个事务在这个范围增加一条数据，这时候第一个事务就会丢失对新增数据的修改。
+
+__总结__：
+
+隔离级别越高，越能保证数据的完整性和一致性，但是对并发性能的影响也越大。
+
+大多数的数据库默认隔离级别为 Read Commited，比如 SqlServer、Oracle
+
+少数数据库默认隔离级别为：Repeatable Read 比如： MySQL InnoDB
+
+###四、Spring中的隔离级别
+|常量	|解释
+|-----|----
+|ISOLATION_DEFAULT	|这是个 PlatfromTransactionManager 默认的隔离级别，使用数据库默认的事务隔离级别。另外四个与 JDBC 的隔离级别相对应。
+|ISOLATION_READ_UNCOMMITTED	|这是事务最低的隔离级别，它充许另外一个事务可以看到这个事务未提交的数据。这种隔离级别会产生脏读，不可重复读和幻像读。
+|ISOLATION_READ_COMMITTED	|保证一个事务修改的数据提交后才能被另外一个事务读取。另外一个事务不能读取该事务未提交的数据。
+|ISOLATION_REPEATABLE_READ	|这种事务隔离级别可以防止脏读，不可重复读。但是可能出现幻像读。
+|ISOLATION_SERIALIZABLE	|这是花费最高代价但是最可靠的事务隔离级别。事务被处理为顺序执行。
+###五、事务的嵌套
+通过上面的理论知识的铺垫，我们大致知道了数据库事务和spring事务的一些属性和特点，接下来我们通过分析一些嵌套事务的场景，来深入理解spring事务传播的机制。
+
+假设外层事务 Service A 的 Method A() 调用 内层Service B 的 Method B()
+
+__PROPAGATION_REQUIRED(spring 默认)__
+
+如果ServiceB.methodB() 的事务级别定义为 PROPAGATION_REQUIRED，那么执行 ServiceA.methodA() 的时候spring已经起了事务，这时调用 ServiceB.methodB()，ServiceB.methodB() 看到自己已经运行在 ServiceA.methodA() 的事务内部，就不再起新的事务。
+
+假如 ServiceB.methodB() 运行的时候发现自己没有在事务中，他就会为自己分配一个事务。
+
+这样，在 ServiceA.methodA() 或者在 ServiceB.methodB() 内的任何地方出现异常，事务都会被回滚。
+
+__PROPAGATION_REQUIRES_NEW__
+
+比如我们设计 ServiceA.methodA() 的事务级别为 PROPAGATION_REQUIRED，ServiceB.methodB() 的事务级别为 PROPAGATION_REQUIRES_NEW。
+
+那么当执行到 ServiceB.methodB() 的时候，ServiceA.methodA() 所在的事务就会挂起，ServiceB.methodB() 会起一个新的事务，等待 ServiceB.methodB() 的事务完成以后，它才继续执行。
+
+他与 PROPAGATION_REQUIRED 的事务区别在于事务的回滚程度了。因为 ServiceB.methodB() 是新起一个事务，那么就是存在两个不同的事务。如果 ServiceB.methodB() 已经提交，那么 ServiceA.methodA() 失败回滚，ServiceB.methodB() 是不会回滚的。如果 ServiceB.methodB() 失败回滚，如果他抛出的异常被 ServiceA.methodA() 捕获，ServiceA.methodA() 事务仍然可能提交(主要看B抛出的异常是不是A会回滚的异常)。
+
+__PROPAGATION_SUPPORTS__
+
+假设ServiceB.methodB() 的事务级别为 PROPAGATION_SUPPORTS，那么当执行到ServiceB.methodB()时，如果发现ServiceA.methodA()已经开启了一个事务，则加入当前的事务，如果发现ServiceA.methodA()没有开启事务，则自己也不开启事务。这种时候，内部方法的事务性完全依赖于最外层的事务。
+
+__PROPAGATION_NESTED__
+
+现在的情况就变得比较复杂了, ServiceB.methodB() 的事务属性被配置为 PROPAGATION_NESTED, 此时两者之间又将如何协作呢? ServiceB#methodB 如果 rollback, 那么内部事务(即 ServiceB#methodB) 将回滚到它执行前的 SavePoint 而外部事务(即 ServiceA#methodA) 可以有以下两种处理方式:
+
+a、捕获异常，执行异常分支逻辑
+``` java
+void methodA() { 
+ 
+        try { 
+ 
+            ServiceB.methodB(); 
+ 
+        } catch (SomeException) { 
+ 
+            // 执行其他业务, 如 ServiceC.methodC(); 
+ 
+        } 
+ 
+    }
+```
+这种方式也是嵌套事务最有价值的地方, 它起到了分支执行的效果, 如果 ServiceB.methodB 失败, 那么执行 ServiceC.methodC(), 而 ServiceB.methodB 已经回滚到它执行之前的 SavePoint, 所以不会产生脏数据(相当于此方法从未执行过), 这种特性可以用在某些特殊的业务中, 而 PROPAGATION_REQUIRED 和 PROPAGATION_REQUIRES_NEW 都没有办法做到这一点。
+
+b、 外部事务回滚/提交 代码不做任何修改, 那么如果内部事务(ServiceB#methodB) rollback, 那么首先 ServiceB.methodB 回滚到它执行之前的 SavePoint(在任何情况下都会如此), 外部事务(即 ServiceA#methodA) 将根据具体的配置决定自己是 commit 还是 rollback
+
+另外三种事务传播属性基本用不到，在此不做分析。
+
+###六、总结
+对于项目中需要使用到事务的地方，我建议开发者还是使用spring的TransactionCallback接口来实现事务，不要盲目使用spring事务注解，如果一定要使用注解，那么一定要对spring事务的传播机制和隔离级别有个详细的了解，否则很可能发生意想不到的效果。
+##2.spring的bean的生命周期
+Spring上下问中的Bean的生命周期与Servlet的生命周期相似，实例化，初始化init、接收请求service、销毁destroy；
+
+  1. 实例化一个Bean，就是我们通常说的new
+  2. 按照Spring上下问对实例化的Bean进行配置，也就是IOC注入
+  3.如果这个Bean实现了BeanNameAware接口，会调用它实现的setBeanName(String beanId)方法，此处传递的是Spring配置文件中的Bean的id
+  4.如果这个Bean实现了BeanFactoryAware接口，会调用它实现的setBeanFactory(),传递的是Spring工厂本身（可以用这个方法获取到其他的Bean）
+  5.如果这个Bean实现了ApplicationContextAware接口，会调用setApplicationContext(ApplicationContext)方法，传入Spring上下文，该方式同样可以实现步骤4，但比4更好，因为ApplicationContext是BeanFactory的子接口，有更多的实现方法
+  6.如果这个Bean关联了BeanPostProcessor接口，将会调用postProcessBeforeInitialization(Object obj,String s)方法，BeanPostProcessor经常被用作是Bean内容的更改，并且由于这个是在Bean初始化结束是调用的After方法，也可用与内存或缓存技术
+  7.如果这个Bean在Spring配置文件中配置了init-method属性会自动调用其配置的初始化方法
+  8.如果这个Bean关联了BeanPostProcessor接口，将会调用postAfterInitialization(Object obj,String s)方法
+    __注意__:以上工作完成以后就可以用这个Bean了，那这个Bean是一个single的，所以一般情况下我们调用同一个id的Bean会是在内容地址相同的实例
+  9.当Bean不再需要时，会经过清理阶段，如果Bean实现了DisposableBean接口，会调用其实现的destroy方法
+  10.最后，如果这个Bean的Spring配置中配置了destroy-method属性，会自动调用其配置的销毁方法
+
+##3.java线程池模型有几种
+Java提供了四种线程池
+
+### newCachedThreadPool ：
+
+可缓存线程池，若线程池长度超过处理需要，则回收空线程，否则创建新线程，线程规模可无限大。
+
+```
+ExecutorService cachedThreadPool = Executors.newCachedThreadPool();
+```
+
+当执行第二个任务时第一个任务已经完成，会复用执行第一个任务的线程，而不用每次新建线程。
+
+### newFixedThreadPool ：
+
+定长线程池，可控制线程最大并发数，超出的线程会在队列中等待。
+
+```
+ExecutorService fixedThreadPool = Executors.newFixedThreadPool(3);
+```
+
+定长线程池的大小最好根据系统资源进行设置。如Runtime.getRuntime().availableProcessors()。
+
+### newScheduledThreadPool ：
+
+定长线程池，支持定时及周期性任务执行，类似Timer。
+
+```
+ScheduledExecutorService scheduledThreadPool = Executors.newScheduledThreadPool(5);
+```
+
+使用实例：
+
+```
+ScheduledExecutorService scheduledThreadPool = Executors.newScheduledThreadPool(5);
+//表示延迟1秒后每3秒执行一次。
+scheduledThreadPool.scheduleAtFixedRate(new Runnable() {
+    @Override
+    public void run() {
+        System.out.println("delay 1 seconds, and excute every 3 seconds");
+    }
+}, 1, 3, TimeUnit.SECONDS);
+```
+
+### newSingleThreadExecutor ：
+
+单线程 的线程池，支持FIFO, LIFO, 优先级策略。
+
+```
+ExecutorService singleThreadExecutor = Executors.newSingleThreadExecutor();
+```
+
+通过观察源码，其中四种线程的创建都是创建一个ThreadPoolExecutor。其中ThreadPoolExecutor是ExecutorService接口的实现类。
+
+##4.如何让有状态的服务变为无状态的服务
+
+未整理
+
+##5.java gc有几种模型
+Java有**四种类型的垃圾回收器：**
+
+1.  串行垃圾回收器（Serial Garbage Collector）
+2.  并行垃圾回收器（Parallel Garbage Collector）
+3.  并发标记扫描垃圾回收器（CMS Garbage Collector）
+4.  G1垃圾回收器（G1 Garbage Collector）
+
+[![image](http://upload-images.jianshu.io/upload_images/10487206-bcb515390753fbcc.jpg?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240 "Types-of-Java-Garbage-Collectors3_th_thumb")](http://www.importnew.com/13827.html/types-of-java-garbage-collectors3_th_thumb) 
+
+每种类型都有自己的优势与劣势。重要的是，我们编程的时候可以通过JVM选择垃圾回收器类型。我们通过向JVM传递参数进行选择。每种类型在很大程度上有 所不同并且可以为我们提供完全不同的应用程序性能。理解每种类型的垃圾回收器并且根据应用程序选择进行正确的选择是非常重要的。
+
+### 1、串行垃圾回收器
+
+串行垃圾回收器通过持有应用程序所有的线程进行工作。它为单线程环境设计，只使用一个单独的线程进行垃圾回收，通过冻结所有应用程序线程进行工作，所以可能不适合服务器环境。它最适合的是简单的命令行程序。
+
+通过JVM参数`-XX:+UseSerialGC`可以使用串行垃圾回收器。
+
+### 2、并行垃圾回收器
+
+并行垃圾回收器也叫做 throughput collector 。它是JVM的默认垃圾回收器。与串行垃圾回收器不同，它使用多线程进行垃圾回收。相似的是，它也会冻结所有的应用程序线程当执行垃圾回收的时候
+
+### 3、并发标记扫描垃圾回收器
+
+并发标记垃圾回收使用多线程扫描堆内存，标记需要清理的实例并且清理被标记过的实例。并发标记垃圾回收器只会在下面两种情况持有应用程序所有线程。
+
+1.  当标记的引用对象在tenured区域；
+2.  在进行垃圾回收的时候，堆内存的数据被并发的改变。
+
+相比并行垃圾回收器，并发标记扫描垃圾回收器使用更多的CPU来确保程序的吞吐量。如果我们可以为了更好的程序性能分配更多的CPU，那么并发标记上扫描垃圾回收器是更好的选择相比并发垃圾回收器。
+
+通过JVM参数 `XX:+USeParNewGC` 打开并发标记扫描垃圾回收器。
+
+### 4、G1垃圾回收器
+
+G1垃圾回收器适用于堆内存很大的情况，他将堆内存分割成不同的区域，并且并发的对其进行垃圾回收。G1也可以在回收内存之后对剩余的堆内存空间进行压缩。并发扫描标记垃圾回收器在STW情况下压缩内存。G1垃圾回收会优先选择第一块垃圾最多的区域
+
+通过JVM参数 `–XX:+UseG1GC` 使用G1垃圾回收器
+
+### Java 8 的新特性
+
+在使用G1垃圾回收器的时候，通过 JVM参数 `-XX:+UseStringDeduplication` 。 我们可以通过删除重复的字符串，只保留一个char[]来优化堆内存。这个选择在Java 8 u 20被引入。
+
+我们给出了全部的四种Java垃圾回收器，需要根据应用场景，硬件性能和吞吐量需求来决定使用哪一种。
+
+### 垃圾回收的JVM配置
+
+下面的JVM关键配置都与Java垃圾回收有关。
+
+### 运行的垃圾回收器类型
+
+| 配置 | 描述 |
+| --- | --- |
+| -XX:+UseSerialGC | 串行垃圾回收器 |
+| -XX:+UseParallelGC | 并行垃圾回收器 |
+| -XX:+UseConcMarkSweepGC | 并发标记扫描垃圾回收器 |
+| -XX:ParallelCMSThreads= | 并发标记扫描垃圾回收器 =为使用的线程数量 |
+| -XX:+UseG1GC | G1垃圾回收器 |
+
+### GC的优化配置
+
+| 配置 | 描述 |
+| --- | --- |
+| -Xms | 初始化堆内存大小 |
+| -Xmx | 堆内存最大值 |
+| -Xmn | 新生代大小 |
+| -XX:PermSize | 初始化永久代大小 |
+| -XX:MaxPermSize | 永久代最大容量 |
+
+### 使用JVM GC参数的例子
+
+1 
+
+`java -Xmx12m -Xms3m -Xmn1m -XX:PermSize=20m -XX:MaxPermSize=20m -XX:+UseSerialGC -jar java-application.jar`
+
+
+
+在Java垃圾回收教程的下一部分，我们将会用一个Java程序演示如何监视和分析垃圾回收。
+
+##6.codeReview的内容
+### 整洁的代码
+
+| 清单项目 | 分类 |
+| --- | --- |
+| 使用可以表达实际意图(Intention-Revealing)的名称 | 有意义的名称 |
+| 每一个概念只用一个词 | 有意义的名称 |
+| 使用方案/问题领域名称 | 有意义的名称 |
+| 类应该是比较小的! | 类 |
+| 函数应该是比较小的! | 函数 |
+| 只做一件事 | 函数 |
+| DRY(Don’t Repeat Yourself)原则，(拒绝重复) | 函数 |
+| 用代码来解释自己的做法(译者注：即代码注释) | 注释 |
+| 确定应用了代码格式化 | 格式 |
+| 使用异常而不是返回码 | 异常 |
+| 不要返回Null | 异常 |
+
+> *参考自:[http://techbus.safaribooksonline.com/book/software-engineering-and-development/agile-development/9780136083238](http://techbus.safaribooksonline.com/book/software-engineering-and-development/agile-development/9780136083238)
+
+### 安全
+
+| 清单项目 | 分类 |
+| --- | --- |
+| 如果不用于继承，使类为final | 基础 |
+| 避免重复代码 | 基础 |
+| 权限限制：程序应该运行在保证功能正常的最小权限模式下。 | 基础 |
+| 最小化类和成员的可访问性 | 基础 |
+| 注释出安全相关的信息 | 基础 |
+| 系统的输入必须检查是否有效和在允许范围内 | 拒绝服务(Denial of Service) |
+| 避免对于一些不寻常行为的过分日志 | 拒绝服务(Denial of Service) |
+| 在任何情况下都释放资源(流，连接等等) | 拒绝服务(Denial of Service) |
+| 从异常中清除敏感信息(暴露文件路径，系统内部相关，配置)P | 私密信息(Confidential Information) |
+| 不要把高度敏感的信息写到日志 | 私密信息(Confidential Information) |
+| 考虑把高度敏感的信息在使用后从内存中清除 | 私密信息(Confidential Information) |
+| 限制包，类，接口，方法和域的可访问性 | 可访问性的扩展(Accessibility Extensibility) |
+| 限制类和方法的可扩展性(通过使它为final) | 可访问性的扩展(Accessibility Extensibility) |
+| 检验输入(有效的数据，大小，范围，边界情况等等) | 输入检验(Input Validation) |
+| 把从不可信对象得到的输出作为输入来检验 | 输入检验(Input Validation) |
+| 为native方法定义包装类(而不是定义native方法为pulibc) | 输入检验(Input Validation) |
+| 把从不可信对象得到的输出作为输入来对待 | 可变性 |
+| 使public static域为final(避免调用方(caller)修改它的值) | 可变性 |
+| 避免暴露敏感类的构造函数 | 对象构造 |
+| 避免安全敏感类的序列化 | 序列化反序列化(Serialization Deserialization) |
+| 通过序列化来保护敏感数据 | 序列化反序列化(Serialization Deserialization) |
+| 小心地缓存潜在的特权操作结果 | 序列化反序列化(Serialization Deserialization) |
+| 只有在需要的时候才使用JNI | 访问限制 |
+
+> *参考自: [http://www.oracle.com/technetwork/java/seccodeguide-139067.html](http://www.oracle.com/technetwork/java/seccodeguide-139067.html)
+
+### 性能
+
+| 清单项目 | 分类 |
+| --- | --- |
+| 避免过分的同步 | 并发 |
+| 保持同步区域比较小 | 并发 |
+| 知道string连接的性能情况 | 综合编程 |
+| 避免创建不需要的对象 | 创建和销毁对象 |
+
+> *参考自: [http://techbus.safaribooksonline.com/book/programming/java/9780137150021](http://techbus.safaribooksonline.com/book/programming/java/9780137150021)
+
+### 综合(译者注：原文中的作者把checklist和category对应的列搞错了，译文中已修正)
+
+| 清单项目 | 分类 |
+| --- | --- |
+| 对可以恢复的情况使用已受检异常(checked exceptions)，对于程序错误使用运行时异常(runtime exceptions) | 异常 |
+| 更多地使用标准异常 | 异常 |
+| 不要忽略异常 | 异常 |
+| 检查参数的有效性 | 方法 |
+| 返回空数组或集合，而不是null | 方法 |
+| 最小化类和成员的可访问性 | 类和接口 |
+| 在pulibc类中，使用访问器方法(accessor methods)(译者注：访问器方法即我们平常用的get/set方法)而不是public域 | 类和接口 |
+| 最小化本地变量的范围 | 综合编程 |
+| 通过接口引用对象 | 综合编程 |
+| 遵循广泛接受的命名规则 | 综合编程 |
+| 避免使用finalizer | 创建和销毁对象 |
+| 当你重写equals时总是重写hashCode | 综合编程 |
+| 总是重写toString | 综合编程 |
+| 使用枚举来代替int常量 | 枚举和注解(Annotations) |
+| 使用标记接口(marker interface)(译者注：标记接口是一种没有任何行为的接口，实现它只是为了让实现类属于某种类型，如JDK中的Serializable,Cloneable等)来定义类型 | 枚举和注解(Annotations) |
+| 对共享可变的数据使用同步访问 | 并发 |
+| 使用executors而不是task和thread | 并发 |
+| 注释中描述线程安全情况 | 并发 |
+| 存在有效的JUnit/JBehave测试用例 | 测试 |
+
+> *参考自: [http://techbus.safaribooksonline.com/book/programming/java/9780137150021](http://techbus.safaribooksonline.com/book/programming/java/9780137150021)
+
+### 静态代码分析
+
+| 清单项目 | 分类 |
+| --- | --- |
+| 查看静态代码分析器的报告来进行类的添加和修改 | 静态代码分析 |
+
+##7.悲观锁与乐观锁的实现
+  1.乐观锁是假设不会发生并发问题，通过数据库添加版本号字段，更新时将版本号字段+1，乐观并发控制相信事务之间的数据竞争(data race)的概率是比较小的，因此尽可能直接做下去，直到提交的时候才去锁定，所以不会产生任何锁和死锁。但如果直接简单这么做，还是有可能会遇到不可预期的结果，例如两个事务都读取了数据库的某一行，经过修改以后写回数据库，这时就遇到了问题。
+  2.悲观锁，正如其名，它指的是对数据被外界（包括本系统当前的其他事务，以及来自外部系统的事务处理）修改持保守态度(悲观)，因此，在整个数据处理过程中，将数据处于锁定状态。 悲观锁的实现，往往依靠数据库提供的锁机制 （也只有数据库层提供的锁机制才能真正保证数据访问的排他性，否则，即使在本系统中实现了加锁机制，也无法保证外部系统不会修改数据）
+#### 在数据库中，悲观锁的流程如下：
+
+> 在对任意记录进行修改前，先尝试为该记录加上[排他锁](http://www.hollischuang.com/archives/923)（exclusive locking）。
+> 
+> 如果加锁失败，说明该记录正在被修改，那么当前查询可能要等待或者抛出异常。 具体响应方式由开发者根据实际需要决定。
+> 
+> 如果成功加锁，那么就可以对记录做修改，事务完成后就会解锁了。
+> 
+> 其间如果有其他对该记录做修改或加排他锁的操作，都会等待我们解锁或直接抛出异常。
+
+##8.不同用户对同一账号的并发操作的加锁方式
+未整理
+##9.==与equals的区别
+  __==__比较的是地址，除了java自带的基本类型，java自带的基本类型是比较值
+ __equals__是比较对象的值
+####这个问题引申出来的问题就是java的内存模型
+Java内存分配主要包括以下几个区域:
+
+1. 寄存器：我们在程序中无法控制
+
+2. 栈：存放基本类型的数据和对象的引用，但对象本身不存放在栈中，而是存放在堆中
+
+3. 堆：存放用new产生的数据
+
+4. 静态域：存放在对象中用static定义的静态成员
+
+5. 常量池：存放常量
+
+6. 非RAM(随机存取存储器)存储：硬盘等永久存储空间
+
+*****************************************************************
+
+__Java内存分配中的栈__
+
+　　在函数中定义的一些基本类型的变量数据和对象的引用变量都在函数的栈内存中分配。当在一段代码块定义一个变量时，Java就在栈中为这个变量分配内存空间，当该变量退出该作用域后，Java会自动释放掉为该变量所分配的内存空间，该内存空间可以立即被另作他用。 
+
+__Java内存分配中的堆__
+
+　　堆内存用来存放由new创建的对象和数组。 在堆中分配的内存，由Java虚拟机的自动垃圾回收器来管理。
+
+ 　　在堆中产生了一个数组或对象后，还可以 在栈中定义一个特殊的变量，让栈中这个变量的取值等于数组或对象在堆内存中的首地址，栈中的这个变量就成了数组或对象的引用变量。引用变量就相当于是为数组或对象起的一个名称，以后就可以在程序中使用栈中的引用变量来访问堆中的数组或对象。引用变量就相当于是为数组或者对象起的一个名称。
+
+　　引用变量是普通的变量，定义时在栈中分配，引用变量在程序运行到其作用域之外后被释放。而数组和对象本身在堆中分配，即使程序运行到使用 new 产生数组或者对象的语句所在的代码块之外，数组和对象本身占据的内存不会被释放，数组和对象在没有引用变量指向它的时候，才变为垃圾，不能在被使用，但仍 然占据内存空间不放，在随后的一个不确定的时间被垃圾回收器收走（释放掉）。这也是 Java 比较占内存的原因。 
+
+　　实际上，栈中的变量指向堆内存中的变量，这就是Java中的指针！ 
+
+__常量池 (constant pool)__
+
+　　常量池指的是在编译期被确定，并被保存在已编译的.class文件中的一些数据。除了包含代码中所定义的各种基本类型（如int、long等等）和对象型（如String及数组）的常量值(final)还包含一些以文本形式出现的符号引用，比如： 
+
+    类和接口的全限定名；
+    字段的名称和描述符； 
+    方法和名称和描述符。
+　　虚拟机必须为每个被装载的类型维护一个常量池。常量池就是该类型所用到常量的一个有序集和，包括直接常量（string,integer和 floating point常量）和对其他类型，字段和方法的符号引用。
+
+　　对于String常量，它的值是在常量池中的。而JVM中的常量池在内存当中是以表的形式存在的， 对于String类型，有一张固定长度的CONSTANT_String_info表用来存储文字字符串值，注意：该表只存储文字字符串值，不存储符号引 用。说到这里，对常量池中的字符串值的存储位置应该有一个比较明了的理解了。
+
+　　在程序执行的时候,常量池会储存在Method Area,而不是堆中。
+
+__堆与栈__
+
+　　Java的堆是一个运行时数据区,类的(对象从中分配空间。这些对象通过new、newarray、 anewarray和multianewarray等指令建立，它们不需要程序代码来显式的释放。堆是由垃圾回收来负责的，堆的优势是可以动态地分配内存大小，生存期也不必事先告诉编译器，因为它是在运行时动态分配内存的，Java的垃圾收集器会自动收走这些不再使用的数据。但缺点是，由于要在运行时动态 分配内存，存取速度较慢。 
+
+　　栈的优势是，存取速度比堆要快，仅次于寄存器，栈数据可以共享。但缺点是，存在栈中的数据大小与生存期必须是确定的，缺乏灵活性。栈中主要存放一些基本类型的变量数据（int, short, long, byte, float, double, boolean, char）和对象句柄(引用)。
+
+******************************************************************
+
+ 
+
+　　这里我们主要关心栈，堆和常量池，对于栈和常量池中的对象可以共享，对于堆中的对象不可以共享。栈中的数据大小和生命周期是可以确定的，当没有引用指向数据时，这个数据就会消失。堆中的对象的由垃圾回收器负责回收，因此大小和生命周期不需要确定，具有很大的灵活性。
+
+__字符串内存分配：__
+
+　　对于字符串，其对象的引用都是存储在栈中的，如果是编译期已经创建好(直接用双引号定义的)的就存储在常量池中，如果是运行期（new出来的）才能确定的就存储在堆中。对于equals相等的字符串，在常量池中永远只有一份，在堆中有多份。 
+原文：[https://www.cnblogs.com/SaraMoring/p/5687466.html](https://www.cnblogs.com/SaraMoring/p/5687466.html)
+##10.runtimeException与普通Exception的区别
+1.java将所有的错误封装为一个对象，其根本父类为Throwable, Throwable有两个子类：Error和Exception。
+
+*![image](http://upload-images.jianshu.io/upload_images/10487206-8a340a18d81d8f2b.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240)
+
+2.`Error`是`Throwable` 的子类，用于指示合理的应用程序不应该试图捕获的严重问题。大多数这样的错误都是异常条件。虽然   `ThreadDeath` 错误是一个“正规”的条件，但它也是 `Error` 的子类，因为大多数应用程序都不应该试图捕获它。在执行该方法期间，无需在其 `throws` 子句中声明可能抛出但是未能捕获的 `Error`的任何子类，因为这些错误可能是再也不会发生的异常条件。
+
+3.`Exception`类及其子类是 `Throwable` 的一种形式，它指出了合理的应用程序想要捕获的条件。
+
+4.`RuntimeException`是那些可能在 Java 虚拟机正常运行期间抛出的异常的超类。可能在执行方法期间抛出但未被捕获的`RuntimeException` 的任何子类都无需在 `throws` 子句中进行声明。它是Exception的子类。*
+
+5.异常的分类
+  __Error__：一般为底层的不可恢复的类；
+  **Exception**：分为未检查异常(RuntimeException)和已检查异常(非RuntimeException)。
+  未检查异常是因为程序员没有进行必需要的检查，因为疏忽和错误而引起的错误。几个经典的RunTimeException如下：* 
+``` java
+  1. java.lang.NullPointerException;
+  2. java.lang.ArithmaticException;
+  3. java.lang.ArrayIndexoutofBoundsException</pre>
+```
+
+__Runtime Exception__： 
+在定义方法时不需要声明会抛出runtime exception； 在调用这个方法时不需要捕获这个runtime exception； runtime exception是从java.lang.RuntimeException或java.lang.Error类衍生出来的。 例如：nullpointexception，IndexOutOfBoundsException就属于runtime exception 
+
+ __Exception__:
+定义方法时必须声明所有可能会抛出的exception； 在调用这个方法时，必须捕获它的checked exception，不然就得把它的exception传递下去；exception是从java.lang.Exception类衍生出来的。例如：IOException，SQLException就属于Exception
+
+Exception 属于应用程序级别的异常，这类异常必须捕捉,Exception体系包括RuntimeException体系和其他非RuntimeException的体系
+
+RuntimeException 表示系统异常，比较严重，如果出现RuntimeException，那么一定是程序员的错误
+
+##11.java try catch 的原理
+1.类会跟随一张 异常表（exception table），每一个try catch都会在这个表里添加行记录，每一个记录都有4个信息（try catch的开始地址，结束地址，异常的处理起始位，异常类名称）。
+2.当代码在运行时抛出了异常时，首先拿着抛出位置到异常表中查找是否可以被catch（例如看位置是不是处于任何一栏中的开始和结束位置之间），如果可以则跑到异常处理的起始位置开始处理，如果没有找到则原地return，并且copy异常的引用给父调用方，接着看父调用的异常表。。。以此类推。
+##12.表单防止重复提交
+1.在前端用js设置标志位，无法控制刷新页面提交的，也无法控制后退页面重新提交的
+2.具体的做法：在服务器端生成一个唯一的随机标识号，专业术语称为Token(令牌)，同时在当前用户的Session域中保存这个Token。然后将Token发送到客户端的Form表单中，在Form表单中使用隐藏域来存储这个Token，表单提交的时候连同这个Token一起提交到服务器端，然后在服务器端判断客户端提交上来的Token与服务器端生成的Token是否一致，如果不一致，那就是重复提交了，此时服务器端就可以不处理重复提交的表单。如果相同则处理表单提交，处理完后清除当前用户的Session域中存储的标识号，多节点服务的此方法会失效。
+
+在下列情况下，服务器程序将拒绝处理用户提交的表单请求：
+
+      存储Session域中的Token(令牌)与表单提交的Token(令牌)不同。
+      当前用户的Session中不存在Token(令牌)。
+      用户提交的表单数据中没有Token(令牌)。
+3.多服务的时候将token存在redis中，在springmvc配置文件中加入拦截器的配置，当转到页面的请求到来时，生成token的名字和token值，一份放到redis缓存中，一份放传给页面表单的隐藏域。
+
+当表单请求提交时，拦截器得到参数中的tokenName和token，然后到缓存中去取token值，如果能匹配上，请求就通过，不能匹配上就不通过。这里的tokenName生成时也是随机的，每次请求都不一样。而从缓存中取token值时，会立即将其删除（删与读是原子的，无线程安全问题）。
+对于重复提交、重复刷新、防止后退等等都是属于系统为避免重复记录而需要解决的问题，在客户端去处理需要针对每一种的可能提出相应的解决方案，然而在服务器端看来只不过是对于数据真实性的检验问题，基于令牌的处理就是一劳永逸的方法。 
+
+
+4.使用timestamp和nonce来做的重放机制。
+
+timestamp用来表示请求的当前时间戳，这个时间戳当然要和服务器时间戳进行校正过的。我们预期正常请求带的timestamp参数会是不同的（预期是正常的人每秒至多只会做一个操作）。每个请求带的时间戳不能和当前时间超过一定规定的时间。比如60s。这样，这个请求即使被截取了，你也只能在60s内进行重放攻击。过期失效。
+
+但是这样也是不够的，还有给攻击者60s的时间。所以我们就需要使用一个nonce，随机数。
+
+nonce是由客户端根据足够随机的情况生成的，比如 md5(timestamp+rand(0, 1000)); 它就有一个要求，正常情况下，在短时间内（比如60s）连续生成两个相同nonce的情况几乎为0。
+
+__服务端__
+
+服务端第一次在接收到这个nonce的时候做下面行为：
+1 去redis中查找是否有key为nonce:{nonce}的string
+2 如果没有，则创建这个key，把这个key失效的时间和验证timestamp失效的时间一致，比如是60s。
+3 如果有，说明这个key在60s内已经被使用了，那么这个请求就可以判断为重放请求。
+
+__示例__
+
+那么比如，下面这个请求：
+
+http://a.com?uid=123&timestamp=1480556543&nonce=43f34f33&sign=80b886d71449cb33355d017893720666
+
+这个请求中的uid是我们真正需要传递的有意义的参数
+
+timestamp，nonce，sign都是为了签名和防重放使用。
+
+timestamp是发送接口的时间，nonce是随机串，sign是对uid，timestamp,nonce(对于一些rest风格的api，我建议也把url放入sign签名)。签名的方法可以是md5({密钥}key1=val1&key2=val2&key3=val3...)
+
+服务端接到这个请求：
+1 先验证sign签名是否合理，证明请求参数没有被中途篡改
+2 再验证timestamp是否过期，证明请求是在最近60s被发出的
+3 最后验证nonce是否已经有了，证明这个请求不是60s内的重放请求
+##13.翻转单向链表
+    /** 
+     * 递归，在反转当前节点之前先反转后续节点 
+     */  
+    public static Node Reverse1(Node head) {  
+        // head看作是前一结点，head.getNext()是当前结点，reHead是反转后新链表的头结点  
+        if (head == null || head.getNext() == null) {  
+            return head;// 若为空链或者当前结点在尾结点，则直接还回  
+        }  
+        Node reHead = Reverse1(head.getNext());// 先反转后续节点head.getNext()  
+        head.getNext().setNext(head);// 将当前结点的指针域指向前一结点  
+        head.setNext(null);// 前一结点的指针域令为null;  
+        return reHead;// 反转后新链表的头结点  
+    }  
+
+    /** 
+     * 遍历，将当前节点的下一个节点缓存后更改当前节点指针 
+     */  
+    public static Node reverse2(Node head) {  
+        if (head == null)  
+            return head;  
+        Node pre = head;// 上一结点  
+        Node cur = head.getNext();// 当前结点  
+        Node tmp;// 临时结点，用于保存当前结点的指针域（即下一结点）  
+        while (cur != null) {// 当前结点为null，说明位于尾结点  
+            tmp = cur.getNext();  
+            cur.setNext(pre);// 反转指针域的指向  
+  
+            // 指针往下移动  
+            pre = cur;  
+            cur = tmp;  
+        }  
+        // 最后将原链表的头节点的指针域置为null，还回新链表的头结点，即原链表的尾结点  
+        head.setNext(null);  
+          
+        return pre;  
+    }  
+##14.java锁机制的底层实现
+**一、synchronized的字节码表示：**
+      在java语言中存在两种内建的synchronized语法：1、synchronized语句；2、synchronized方法。对于synchronized语句当Java源代码被javac编译成bytecode的时候，会在同步块的入口位置和退出位置分别插入monitorenter和monitorexit字节码指令。而synchronized方法则会被翻译成普通的方法调用和返回指令如:invokevirtual、areturn指令，在VM字节码层面并没有任何特别的指令来实现被synchronized修饰的方法，而是在Class文件的方法表中将该方法的access_flags字段中的synchronized标志位置1，表示该方法是同步方法并使用调用该方法的对象或该方法所属的Class在JVM的内部对象表示Klass做为锁对象。
+
+**二、JVM中锁的优化：**
+      简单来说在JVM中monitorenter和monitorexit字节码依赖于底层的操作系统的Mutex Lock来实现的，但是由于使用Mutex Lock需要将当前线程挂起并从用户态切换到内核态来执行，这种切换的代价是非常昂贵的；然而在现实中的大部分情况下，同步方法是运行在单线程环境（无锁竞争环境）如果每次都调用Mutex Lock那么将严重的影响程序的性能。不过在jdk1.6中对锁的实现引入了大量的优化，如锁粗化（Lock Coarsening）、锁消除（Lock Elimination）、轻量级锁（Lightweight Locking）、偏向锁（Biased Locking）、适应性自旋（Adaptive Spinning）等技术来减少锁操作的开销。
+
+**锁粗化（Lock Coarsening）：**也就是减少不必要的紧连在一起的unlock，lock操作，将多个连续的锁扩展成一个范围更大的锁。
+
+**锁消除（Lock Elimination）：**通过运行时JIT编译器的逃逸分析来消除一些没有在当前同步块以外被其他线程共享的数据的锁保护，通过逃逸分析也可以在线程本地Stack上进行对象空间的分配（同时还可以减少Heap上的垃圾收集开销）。
+
+**轻量级锁（Lightweight Locking）：**这种锁实现的背后基于这样一种假设，即在真实的情况下我们程序中的大部分同步代码一般都处于无锁竞争状态（即单线程执行环境），在无锁竞争的情况下完全可以避免调用操作系统层面的重量级互斥锁，取而代之的是在monitorenter和monitorexit中只需要依靠一条CAS原子指令就可以完成锁的获取及释放。当存在锁竞争的情况下，执行CAS指令失败的线程将调用操作系统互斥锁进入到阻塞状态，当锁被释放的时候被唤醒（具体处理步骤下面详细讨论）。
+
+**偏向锁（Biased Locking）：**是为了在无锁竞争的情况下避免在锁获取过程中执行不必要的CAS原子指令，因为CAS原子指令虽然相对于重量级锁来说开销比较小但还是存在非常可观的本地延迟（可参考这篇[文章](https://blogs.oracle.com/dave/entry/biased_locking_in_hotspot)）。
+
+**适应性自旋（Adaptive Spinning）：**当线程在获取轻量级锁的过程中执行CAS操作失败时，在进入与monitor相关联的操作系统重量级锁（mutex semaphore）前会进入忙等待（Spinning）然后再次尝试，当尝试一定的次数后如果仍然没有成功则调用与该monitor关联的semaphore（即互斥锁）进入到阻塞状态。
+
+**三、对象头（Object Header）：**
+
+![image](http://upload-images.jianshu.io/upload_images/10487206-1dc3430c7b21beaa.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240) 
+
+在JVM中创建对象时会在对象前面加上两个字大小的对象头，在32位机器上一个字为32bit，根据不同的状态位Mark World中存放不同的内容，如上图所示在轻量级锁中，Mark Word被分成两部分，刚开始时LockWord为被设置为HashCode、最低三位表示LockWord所处的状态，初始状态为001表示无锁状态。Klass ptr指向Class字节码在虚拟机内部的对象表示的地址。Fields表示连续的对象实例字段。
+
+**四、Monitor Record：**
+
+Monitor Record是线程私有的数据结构，每一个线程都有一个可用monitor record列表，同时还有一个全局的可用列表；那么这些monitor record有什么用呢？每一个被锁住的对象都会和一个monitor record关联（对象头中的LockWord指向monitor record的起始地址，由于这个地址是8byte对齐的所以LockWord的最低三位可以用来作为状态位），同时monitor record中有一个Owner字段存放拥有该锁的线程的唯一标识，表示该锁被这个线程占用。如下图所示为Monitor Record的内部结构： 
+
+![image](http://upload-images.jianshu.io/upload_images/10487206-9aa010ed7f207c03.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240) 
+
+Owner：初始时为NULL表示当前没有任何线程拥有该monitor record，当线程成功拥有该锁后保存线程唯一标识，当锁被释放时又设置为NULL；
+
+EntryQ:关联一个系统互斥锁（semaphore），阻塞所有试图锁住monitor record失败的线程。
+
+RcThis:表示blocked或waiting在该monitor record上的所有线程的个数。
+
+Nest:用来实现重入锁的计数。
+
+HashCode:保存从对象头拷贝过来的HashCode值（可能还包含GC age）。
+
+Candidate:用来避免不必要的阻塞或等待线程唤醒，因为每一次只有一个线程能够成功拥有锁，如果每次前一个释放锁的线程唤醒所有正在阻塞或等待的线程，会引起不必要的上下文切换（从阻塞到就绪然后因为竞争锁失败又被阻塞）从而导致性能严重下降。Candidate只有两种可能的值0表示没有需要唤醒的线程1表示要唤醒一个继任线程来竞争锁。
+
+**五、轻量级锁具体实现：**
+
+ 一个线程能够通过两种方式锁住一个对象：1、通过膨胀一个处于无锁状态（状态位001）的对象获得该对象的锁；2、对象已经处于膨胀状态（状态位00）但LockWord指向的monitor record的Owner字段为NULL，则可以直接通过CAS原子指令尝试将Owner设置为自己的标识来获得锁。
+
+获取锁（monitorenter）的大概过程如下：
+
+（1）当对象处于无锁状态时（RecordWord值为HashCode，状态位为001），线程首先从自己的可用moniter record列表中取得一个空闲的moniter record，初始Nest和Owner值分别被预先设置为1和该线程自己的标识，一旦monitor record准备好然后我们通过CAS原子指令安装该monitor record的起始地址到对象头的LockWord字段来膨胀(原文为inflate，我觉得之所以叫inflate主要是由于当对象被膨胀后扩展了对象的大小；为了空间效率，将monitor record结构从对象头中抽出去，当需要的时候才将该结构attach到对象上，但是和这篇[Paper](http://www.oracleimg.com/technetwork/java/biasedlocking-oopsla2006-wp-149958.pdf)有点互相矛盾，两种实现方式稍微有点不同)该对象，如果存在其他线程竞争锁的情况而调用CAS失败，则只需要简单的回到monitorenter重新开始获取锁的过程即可。 
+
+（2）对象已经被膨胀同时Owner中保存的线程标识为获取锁的线程自己，这就是重入（reentrant）锁的情况，只需要简单的将Nest加1即可。不需要任何原子操作，效率非常高。
+
+（3）对象已膨胀但Owner的值为NULL，当一个锁上存在阻塞或等待的线程同时锁的前一个拥有者刚释放锁时会出现这种状态，此时多个线程通过CAS原子指令在多线程竞争状态下试图将Owner设置为自己的标识来获得锁，竞争失败的线程在则会进入到第四种情况（4）的执行路径。
+
+（4）对象处于膨胀状态同时Owner不为NULL(被锁住)，在调用操作系统的重量级的互斥锁之前先自旋一定的次数，当达到一定的次数时如果仍然没有成功获得锁，则开始准备进入阻塞状态，首先将rfThis的值原子性的加1，由于在加1的过程中可能会被其他线程破坏Object和monitor record之间的关联，所以在原子性加1后需要再进行一次比较以确保LockWord的值没有被改变，当发现被改变后则要重新进行monitorenter过程。同时再一次观察Owner是否为NULL，如果是则调用CAS参与竞争锁，锁竞争失败则进入到阻塞状态。
+
+释放锁（monitorexit）的大概过程如下：
+
+（1）首先检查该对象是否处于膨胀状态并且该线程是这个锁的拥有者，如果发现不对则抛出异常；
+
+（2）检查Nest字段是否大于1，如果大于1则简单的将Nest减1并继续拥有锁，如果等于1，则进入到第（3）步；
+
+（3）检查rfThis是否大于0，设置Owner为NULL然后唤醒一个正在阻塞或等待的线程再一次试图获取锁，如果等于0则进入到第（4）步
+
+（4）缩小（deflate）一个对象，通过将对象的LockWord置换回原来的HashCode值来解除和monitor record之间的关联来释放锁，同时将monitor record放回到线程是有的可用monitor record列表。
+__转自__[http://www.cnblogs.com/javaminer/p/3889023.html](http://www.cnblogs.com/javaminer/p/3889023.html)
+##15.java并发包内容
+java.util.concurrent下主要的接口和类：
+
+Executor：具体Runnable任务的执行者。
+
+ExecutorService:一个线程池管理者，其实现类有多种，比如普通线程池，定时调度线程池ScheduledExecutorService等，我们能把一个Runnable,Callable提交到池中让其调度。
+
+Future：是与Runnable,Callable进行交互的接口，比如一个线程执行结束后取返回的结果等等，还提供了cancel终止线程。
+
+BlockingQueue：阻塞队列。
+##16.jvm的组成
+默认的，新生代 ( Young ) 与老年代 ( Old ) 的比例的值为 1:2 ( 该值可以通过参数 –XX:NewRatio 来指定 )，即：新生代 ( Young ) = 1/3 的堆空间大小。老年代 ( Old ) = 2/3 的堆空间大小。其中，新生代 ( Young ) 被细分为 Eden 和 两个 Survivor 区域，这两个 Survivor 区域分别被命名为 from 和 to，以示区分。
+默认的，Edem : from : to = 8 : 1 : 1 ( 可以通过参数 –XX:SurvivorRatio 来设定 )，即： Eden = 8/10 的新生代空间大小，from = to = 1/10 的新生代空间大小。
+JVM 每次只会使用 Eden 和其中的一块 Survivor 区域来为对象服务，所以无论什么时候，总是有一块 Survivor 区域是空闲着的。
+因此，新生代实际可用的内存空间为 9/10 ( 即90% )的新生代空间。
+##17.gc新生代什么时候会晋升为老年代
+Java 中的堆也是 GC 收集垃圾的主要区域。GC 分为两种：Minor GC、Full GC ( 或称为 Major GC )。
+Minor GC 是发生在新生代中的垃圾收集动作，所采用的是复制算法。
+新生代几乎是所有 Java 对象出生的地方，即 Java 对象申请的内存以及存放都是在这个地方。Java 中的大部分对象通常不需长久存活，具有朝生夕灭的性质。
+当一个对象被判定为 "死亡" 的时候，GC 就有责任来回收掉这部分对象的内存空间。新生代是 GC 收集垃圾的频繁区域。
+当对象在 Eden ( 包括一个 Survivor 区域，这里假设是 from 区域 ) 出生后，在经过一次 Minor GC 后，如果对象还存活，并且能够被另外一块 Survivor 区域所容纳( 上面已经假设为 from 区域，这里应为 to 区域，即 to 区域有足够的内存空间来存储 Eden 和 from 区域中存活的对象 )，则使用复制算法将这些仍然还存活的对象复制到另外一块 Survivor 区域 ( 即 to 区域 ) 中，然后清理所使用过的 Eden 以及 Survivor 区域 ( 即 from 区域 )，并且将这些对象的年龄设置为1，以后对象在 Survivor 区每熬过一次 Minor GC，就将对象的年龄 + 1，当对象的年龄达到某个值时 ( 默认是 15 岁，可以通过参数 -XX:MaxTenuringThreshold 来设定 )，这些对象就会成为老年代。
+但这也不是一定的，对于一些较大的对象 ( 即需要分配一块较大的连续内存空间 ) 则是直接进入到老年代。
+Full GC 是发生在老年代的垃圾收集动作，所采用的是标记-清除算法。
+现实的生活中，老年代的人通常会比新生代的人 "早死"。堆内存中的老年代(Old)不同于这个，老年代里面的对象几乎个个都是在 Survivor 区域中熬过来的，它们是不会那么容易就 "死掉" 了的。因此，Full GC 发生的次数不会有 Minor GC 那么频繁，并且做一次 Full GC 要比进行一次 Minor GC 的时间更长。
+另外，标记-清除算法收集垃圾的时候会产生许多的内存碎片 ( 即不连续的内存空间 )，此后需要为较大的对象分配内存空间时，若无法找到足够的连续的内存空间，就会提前触发一次 GC 的收集动作。
+##18.类加载问题
+```java
+package com.learingspring.demo.markov;
+
+public class ClassB extends ClassA{
+    ClassB(){
+        System.out.println("load B");
+    }
+    {
+        System.out.println("it is B");
+    }
+    static {
+        System.out.println("static B");
+    }
+
+    public static void main(String[] args) {
+        new ClassB();
+    }
+}
+```
+创建ClassB时会先寻找依赖的ClassA，执行顺序是
+1.执行A里的静态块语句
+2.执行B里的静态块语句
+3.执行A里的初始化块语句，执行A的构造方法
+4.执行B里的初始化块语句，执行B的构造方法

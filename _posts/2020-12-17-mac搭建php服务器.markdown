@@ -1,0 +1,26 @@
+mac自带apache和php,只需开启即可使用
+首先,打开"终端",运行 
+```
+sudo apachectl start
+```
+输入密码后,在浏览器输入 http://127.0.0.1 或者 http://localhost ,页面显示"It works!" 表明开启apache成功了
+
+接起来,我们需要配置php,在终端运行 sudo vim /etc/apache2/httpd.conf
+```
+#LoadModule php7_module libexec/apache2/libphp7.so
+```
+```
+sudo cp /etc/php.ini.default /etc/php.ini
+```
+然后终端输入"sudo apachectl restart",重启apache,生效修改
+
+自定义目录
+```
+ sudo vim /etc/apache2/httpd.conf
+找到
+DocumentRoot "/Library/WebServer/Documents"
+```
+输入
+``` 
+sudo apachectl restart
+```
